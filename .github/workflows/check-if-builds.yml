@@ -1,0 +1,19 @@
+name: Check if module is buildable
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: install kernel devel stuff
+      run: sudo apt-get install -y linux-headers-generic
+    - name: make
+      run: make

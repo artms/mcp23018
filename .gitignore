@@ -1,0 +1,9 @@
+.m*
+.M*
+Module.symvers
+mcp23018.ko
+mcp23018.mod
+mcp23018.mod.c
+mcp23018.mod.o
+mcp23018.o
+modules.order
