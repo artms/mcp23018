@@ -9,6 +9,8 @@
 #include <linux/i2c.h>
 #include <linux/of_device.h>
 #include <linux/regmap.h>
+#include <linux/gpio/driver.h>
+#include <linux/pinctrl/pinconf-generic.h>
 
 #define MCP23018 0
 #define MCP_IODIR 0x00
@@ -19,12 +21,12 @@
 #define MCP_IOCON 0x0A
 #define MCP_GPPU 0x0C
 #define MCP_INTF 0x0E
-#define MCP_INTCAP 0x19
+#define MCP_INTCAP 0x10
 #define MCP_GPIO 0x12
 #define MCP_OLAT 0x14
 
 const struct regmap_range mcp23018_volatile_range[] = {
-	{ .range_min = MCP_GPIO, .range_max = MCP_GPIO,}
+	{ .range_min = MCP_GPIO, .range_max = MCP_GPIO },
 };
 
 const struct regmap_access_table mcp23018_volatile_cfg = {
@@ -72,13 +74,109 @@ static const struct of_device_id mcp23018_of_match[] = {
 	{ /* END OF LIST */ },
 };
 
+struct mcp23018 {
+	struct regmap *regmap;
+	struct gpio_chip gpiochip;
+	struct device *dev;
+	struct mutex lock;
+};
+
+#define GPIO_NUM 16
+
+static int mcp23018_direction_output(struct gpio_chip *chip, unsigned int offset, int value)
+{
+	int ret;
+	unsigned int mask = BIT(offset);
+	struct mcp23018 *mcp23018 = gpiochip_get_data(chip);
+
+	mutex_lock(&mcp23018->lock);
+	ret = regmap_update_bits(mcp23018->regmap, MCP_OLAT, mask, value ? mask : 0);
+	if (likely(ret == 0)) {
+		ret = regmap_update_bits(mcp23018->regmap, MCP_IODIR, mask, 0);
+	}
+	mutex_unlock(&mcp23018->lock);
+	return ret;
+}
+
+static int mcp23018_direction_input(struct gpio_chip *chip, unsigned int offset)
+{
+	int ret;
+	unsigned int mask = BIT(offset);
+	struct mcp23018 *mcp23018 = gpiochip_get_data(chip);
+
+	mutex_lock(&mcp23018->lock);
+	ret = regmap_update_bits(mcp23018->regmap, MCP_IODIR, mask, mask);
+	mutex_unlock(&mcp23018->lock);
+	return ret;
+}
+
+static int mcp23018_get_direction(struct gpio_chip *chip, unsigned int offset)
+{
+	unsigned int val;
+	int ret;
+	struct mcp23018 *mcp23018 = gpiochip_get_data(chip);
+
+	mutex_lock(&mcp23018->lock);
+	ret = regmap_read(mcp23018->regmap, MCP_IODIR, &val);
+	mutex_unlock(&mcp23018->lock);
+	if (ret < 0) {
+		return ret;
+	}
+	return !!(val & BIT(offset));
+}
+
+static int mcp23018_set_config(struct gpio_chip *chip, unsigned int offset, unsigned long config)
+{
+	struct mcp23018 *mcp23018 = gpiochip_get_data(chip);
+	enum pin_config_param param = pinconf_to_config_param(config);
+	int ret;
+	switch (param) {
+		case PIN_CONFIG_BIAS_PULL_UP:
+		case PIN_CONFIG_BIAS_DISABLE:
+			mutex_lock(&mcp23018->lock);
+			ret = regmap_update_bits(mcp23018->regmap, MCP_GPPU, BIT(offset), param == PIN_CONFIG_BIAS_PULL_UP ? BIT(offset) : 0);
+			mutex_unlock(&mcp23018->lock);
+			break;
+		default:
+			return -ENOTSUPP;
+	}
+	return ret;
+}
+static int mcp23018_get(struct gpio_chip *chip, unsigned int offset)
+{
+	unsigned int val;
+	int ret;
+	struct mcp23018 *mcp23018 = gpiochip_get_data(chip);
+	mutex_lock(&mcp23018->lock);
+	ret = regmap_read(mcp23018->regmap, MCP_GPIO, &val);
+	mutex_unlock(&mcp23018->lock);
+	if (ret < 0) {
+		return ret;
+	}
+	return !!(val & BIT(offset));
+}
+
+static void mcp23018_set(struct gpio_chip *chip, unsigned int offset, int value)
+{
+	unsigned int mask = BIT(offset);
+	struct mcp23018 *mcp23018 = gpiochip_get_data(chip);
+	mutex_lock(&mcp23018->lock);
+	regmap_update_bits(mcp23018->regmap, MCP_OLAT, mask, value ? mask : 0);
+	mutex_unlock(&mcp23018->lock);
+}
+
 static int mcp23018_i2c_probe(struct i2c_client *client)
 {
-	unsigned int data;
-	int ret;
 	struct regmap *regmap;
 	struct device *dev = &client->dev;
-	dev_info(&client->dev, "starting probing\n");
+	struct mcp23018 *mcp23018;
+
+	dev_info(dev, "starting probing\n");
+
+	mcp23018 = devm_kzalloc(dev, sizeof(*mcp23018), GFP_KERNEL);
+	if (!mcp23018) {
+		return -ENOMEM;
+	}
 
 	regmap = devm_regmap_init_i2c(client, &mcp23018_regmap_config);
 	if (IS_ERR(regmap)) {
@@ -86,12 +184,24 @@ static int mcp23018_i2c_probe(struct i2c_client *client)
 		return PTR_ERR(regmap);
 	}
 
-	ret = regmap_read(regmap, MCP_IODIR, &data);
-	if (ret != 0) {
-		return ret;
-	}
+	mutex_init(&mcp23018->lock);
+	mcp23018->regmap = regmap;
+	mcp23018->dev = dev;
+	mcp23018->gpiochip.label = client->name;
+	mcp23018->gpiochip.base = -1;
+	mcp23018->gpiochip.owner = THIS_MODULE;
+	mcp23018->gpiochip.ngpio = GPIO_NUM;
+	mcp23018->gpiochip.can_sleep = true;
+	mcp23018->gpiochip.parent = dev;
 
-	return 0;
+	mcp23018->gpiochip.get = mcp23018_get;
+	mcp23018->gpiochip.set = mcp23018_set;
+	mcp23018->gpiochip.get_direction = mcp23018_get_direction;
+	mcp23018->gpiochip.direction_input = mcp23018_direction_input;
+	mcp23018->gpiochip.direction_output = mcp23018_direction_output;
+	mcp23018->gpiochip.set_config = mcp23018_set_config;
+
+	return devm_gpiochip_add_data(dev, &mcp23018->gpiochip, mcp23018);
 }
 
 static void mcp23018_i2c_remove(struct i2c_client *client)
