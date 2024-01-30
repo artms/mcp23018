@@ -10,6 +10,7 @@
 #include <linux/of_device.h>
 #include <linux/regmap.h>
 #include <linux/gpio/driver.h>
+#include <linux/gpio/consumer.h>
 #include <linux/pinctrl/pinconf-generic.h>
 
 #define MCP23018 0
@@ -170,8 +171,15 @@ static int mcp23018_i2c_probe(struct i2c_client *client)
 	struct regmap *regmap;
 	struct device *dev = &client->dev;
 	struct mcp23018 *mcp23018;
+	struct gpio_desc *reset_gpio;
 
 	dev_info(dev, "starting probing\n");
+
+	// resetting chip
+	reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(reset_gpio)) {
+		return PTR_ERR(reset_gpio);
+	}
 
 	mcp23018 = devm_kzalloc(dev, sizeof(*mcp23018), GFP_KERNEL);
 	if (!mcp23018) {
